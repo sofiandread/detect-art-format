@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import fitz  # PyMuPDF
 import os
 
@@ -61,5 +61,30 @@ def detect_art_format():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/extract-design-image', methods=['POST'])
+def extract_design_image():
+    try:
+        file = request.files['data']
+        filename = file.filename
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        file.save(filepath)
+
+        doc = fitz.open(filepath)
+        page = doc.load_page(0)
+
+        # Crop to bottom half of the page
+        rect = page.rect
+        clip_rect = fitz.Rect(rect.x0, rect.y0 + rect.height / 2, rect.x1, rect.y1)
+
+        pix = page.get_pixmap(clip=clip_rect, dpi=300)
+        image_path = os.path.join(UPLOAD_FOLDER, f"{filename}_design.png")
+        pix.save(image_path)
+
+        return send_file(image_path, mimetype='image/png')
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
