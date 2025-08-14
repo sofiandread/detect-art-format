@@ -13,7 +13,7 @@ def home():
 @app.route('/detect-art-format', methods=['POST'])
 def detect_art_format():
     try:
-        file = request.files['data']
+        file = request.files['pdf']
         filepath = os.path.join(UPLOAD_FOLDER, file.filename)
         file.save(filepath)
 
@@ -58,7 +58,7 @@ def detect_art_format():
 @app.route('/extract-design-image', methods=['POST'])
 def extract_design_image():
     try:
-        file = request.files['data']
+        file = request.files['pdf']
         filename = file.filename
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         file.save(filepath)
