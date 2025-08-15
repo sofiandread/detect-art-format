@@ -1,90 +1,97 @@
+# app.py  (Flask + PyMuPDF)
 from flask import Flask, request, jsonify, send_file
-import fitz, os
+import fitz  # PyMuPDF
+import os
 
 app = Flask(__name__)
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# -------------------- helpers --------------------
+
+def bottom_half_rect(page):
+    r = page.rect
+    return fitz.Rect(r.x0, r.y0 + r.height / 2.0, r.x1, r.y1)
+
 def rect_from_params(page, data):
-    """Build a fitz.Rect from coordsOrigin=pdf + x,y,width,height; else bottom-half."""
+    """
+    Build a fitz.Rect from coordsOrigin=pdf + x,y,width,height; 
+    if missing, default to bottom-half.
+    """
     if not data or data.get("coordsOrigin") != "pdf":
-        r = page.rect
-        return fitz.Rect(r.x0, r.y0 + r.height/2.0, r.x1, r.y1)
+        return bottom_half_rect(page)
     try:
         x = float(data["x"]); y = float(data["y"])
         w = float(data["width"]); h = float(data["height"])
-        # clamp to page
         pr = page.rect
         rx0 = max(pr.x0, x); ry0 = max(pr.y0, y)
         rx1 = min(pr.x1, x + w); ry1 = min(pr.y1, y + h)
         return fitz.Rect(rx0, ry0, rx1, ry1)
     except Exception:
-        # fallback: bottom-half
-        r = page.rect
-        return fitz.Rect(r.x0, r.y0 + r.height/2.0, r.x1, r.y1)
-
-def count_rasters_in(page, clip):
-    c = 0; area_biggest = 0.0
-    for img in page.get_images(full=True):
-        try:
-            bbox = page.get_image_bbox(img)
-        except Exception:
-            xref = img[0] if isinstance(img, (tuple, list)) else None
-            if not xref: continue
-            bbox = page.get_image_bbox(xref)
-        rb = fitz.Rect(bbox)
-        if rb.intersects(clip):
-            c += 1
-            area_biggest = max(area_biggest, rb.intersect(clip).get_area())
-    return c, area_biggest
+        return bottom_half_rect(page)
 
 def count_vector_segments_in(page, clip):
-    """Count meaningful vector segments in the clip; ignore tiny/template bits."""
+    """
+    Count meaningful vector path segments intersecting the clip,
+    ignoring hairline/template crumbs.
+    """
     drawings = page.get_drawings()
     segs = 0
+    VECTOR_OPS = {"m","l","c","v","y","re","h"}  # move/line/cubic/rect/close
     clip_area = max(1.0, clip.get_area())
 
-    VECTOR_OPS = {"m","l","c","v","y","re","h"}  # path ops
     for d in drawings:
-        # fast reject: drawing bbox outside clip
+        # quick reject: bbox outside clip
         if "rect" in d and not fitz.Rect(d["rect"]).intersects(clip):
             continue
-        stroke_w = float(d.get("width") or 0)
-        # very thin template lines (hairlines)
-        if stroke_w and stroke_w <= 0.25:
+        # ignore ultra-thin template lines
+        if float(d.get("width") or 0) <= 0.25:
             continue
-
-        # ignore very small geometry by bbox area %
-        bbox = fitz.Rect(d["rect"]) if "rect" in d else None
-        if bbox:
-            if bbox.intersect(clip).get_area() / clip_area < 0.0005:  # <0.05% of clip
+        # ignore geometry whose bbox is tiny vs clip
+        if "rect" in d:
+            inter_area = fitz.Rect(d["rect"]).intersect(clip).get_area()
+            if inter_area / clip_area < 0.0005:  # < 0.05% of clip area
                 continue
 
-        # count real path ops that touch the clip
         for it in d.get("items", []):
             op = str(it[0]).lower() if it else ""
-            if op not in VECTOR_OPS: continue
-            pts = it[1] if len(it) > 1 else None
-            if pts and any((hasattr(p, "x") and clip.contains(p)) for p in pts if p is not None):
-                segs += 1
-            else:
+            if op in VECTOR_OPS:
                 segs += 1
     return segs
 
-def decide_format(raster_count, vector_segments, raster_area, clip_area):
-    """Prefer raster if image occupies a meaningful portion of the print box."""
-    VEC_MIN_WEAK = 20     # ignore stray vector crumbs below this
+def find_largest_image_in_clip(page, clip):
+    """
+    Return (xref, interRect, bboxRect) for the image covering largest area in clip.
+    """
+    best = None
+    best_area = 0.0
+    for img in page.get_images(full=True):
+        try:
+            bbox = page.get_image_bbox(img)
+            xref = img[0] if isinstance(img, (tuple, list)) else None
+        except Exception:
+            xref = img[0] if isinstance(img, (tuple, list)) else None
+            if not xref: 
+                continue
+            bbox = page.get_image_bbox(xref)
+        rb = fitz.Rect(bbox)
+        inter = rb.intersect(clip)
+        a = inter.get_area()
+        if a > best_area:
+            best = (xref, inter, rb)
+            best_area = a
+    return best  # (xref, interRect, fullBBox) or None
+
+def decide_format(raster_count, vector_segments):
+    """
+    Heuristic: prefer 'has raster' if any image and few vectors.
+    """
+    VEC_MIN_WEAK   = 20
     VEC_MIN_STRONG = 80
-    RASTER_AREA_RATIO = 0.15  # if image covers ≥15% of clip, call raster/mixed
-
-    raster_ratio = raster_area / max(1.0, clip_area)
-
-    if raster_count > 0 and raster_ratio >= RASTER_AREA_RATIO and vector_segments < VEC_MIN_WEAK:
-        return "has raster"
-    if raster_count > 0 and raster_ratio >= RASTER_AREA_RATIO and vector_segments >= VEC_MIN_WEAK:
-        return "mixed"
     if raster_count > 0 and vector_segments < VEC_MIN_WEAK:
         return "has raster"
+    if raster_count > 0 and vector_segments >= VEC_MIN_WEAK:
+        return "mixed"
     if vector_segments >= VEC_MIN_STRONG and raster_count == 0:
         return "has vector"
     if vector_segments >= VEC_MIN_WEAK and raster_count == 0:
@@ -93,15 +100,43 @@ def decide_format(raster_count, vector_segments, raster_area, clip_area):
         return "has raster"
     return "unknown"
 
+# -------------------- routes --------------------
+
 @app.route("/")
 def home():
     return "Art Format Detector is live!"
 
 @app.route("/detect-art-format", methods=["POST"])
 def detect_art_format():
+    """
+    Form-Data:
+      pdf: file
+      pageIndex: int (default 0)
+      coordsOrigin: 'pdf' to enable x/y/width/height
+      x, y, width, height: PDF points (72 pt = 1 in)
+    Returns:
+      {
+        "format": "has raster" | "has vector" | "mixed" | "unknown",
+        "metrics": {
+          "region": "clip" | "bottom-half",
+          "rasterCount": int,
+          "vectorSegments": int,
+          "nativeRaster": {
+            "nativePxW": int,
+            "nativePxH": int,
+            "placedWIn": float,
+            "placedHIn": float,
+            "nativeDpiX": float,
+            "nativeDpiY": float,
+            "nativeDpiMin": float
+          }
+        }
+      }
+    """
     try:
         if "pdf" not in request.files:
             return jsonify({"error": "No file field 'pdf'"}), 400
+
         file = request.files["pdf"]
         filepath = os.path.join(UPLOAD_FOLDER, file.filename)
         file.save(filepath)
@@ -109,13 +144,45 @@ def detect_art_format():
         doc = fitz.open(filepath)
         page_index = int(request.form.get("pageIndex", "0"))
         page = doc.load_page(page_index)
-
-        # build clip rect from params (if provided)
         clip = rect_from_params(page, request.form)
 
-        raster_count, raster_area_biggest = count_rasters_in(page, clip)
+        # count vector segments in clip
         vector_segments = count_vector_segments_in(page, clip)
-        fmt = decide_format(raster_count, vector_segments, raster_area_biggest, clip.get_area())
+
+        # count total rasters on page (cheap metric)
+        raster_count = len(page.get_images(full=True))
+
+        # largest raster intersecting the clip (for native DPI)
+        native = {}
+        largest = find_largest_image_in_clip(page, clip)
+        if largest:
+            xref, inter_rect, full_bbox = largest
+            native_px_w = native_px_h = 0
+            if xref:
+                try:
+                    info = doc.extract_image(xref)
+                    native_px_w = int(info.get("width") or 0)
+                    native_px_h = int(info.get("height") or 0)
+                except Exception:
+                    pass
+
+            placed_w_in = inter_rect.width / 72.0 if inter_rect.width else 0
+            placed_h_in = inter_rect.height / 72.0 if inter_rect.height else 0
+            dpi_x = (native_px_w / placed_w_in) if placed_w_in > 0 else 0
+            dpi_y = (native_px_h / placed_h_in) if placed_h_in > 0 else 0
+            dpi_min = min(dpi_x, dpi_y) if dpi_x and dpi_y else 0
+
+            native = {
+                "nativePxW": native_px_w,
+                "nativePxH": native_px_h,
+                "placedWIn": round(placed_w_in, 3),
+                "placedHIn": round(placed_h_in, 3),
+                "nativeDpiX": round(dpi_x, 1),
+                "nativeDpiY": round(dpi_y, 1),
+                "nativeDpiMin": round(dpi_min, 1)
+            }
+
+        fmt = decide_format(raster_count, vector_segments)
 
         return jsonify({
             "format": fmt,
@@ -123,18 +190,22 @@ def detect_art_format():
                 "region": "clip" if request.form.get("coordsOrigin") == "pdf" else "bottom-half",
                 "rasterCount": raster_count,
                 "vectorSegments": vector_segments,
-                "rasterAreaLargest": raster_area_biggest,
-                "clipArea": clip.get_area()
+                **({"nativeRaster": native} if native else {})
             }
         })
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route("/extract-design-image", methods=["POST"])
 def extract_design_image():
+    """
+    Optional helper: returns a PNG of the supplied clip at 300 dpi.
+    """
     try:
         if "pdf" not in request.files:
             return jsonify({"error": "No file field 'pdf'"}), 400
+
         file = request.files["pdf"]
         filename = file.filename
         filepath = os.path.join(UPLOAD_FOLDER, filename)
@@ -148,6 +219,7 @@ def extract_design_image():
         pix = page.get_pixmap(clip=clip, dpi=300)
         image_path = os.path.join(UPLOAD_FOLDER, f"{filename}_design.png")
         pix.save(image_path)
+
         return send_file(image_path, mimetype="image/png")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
