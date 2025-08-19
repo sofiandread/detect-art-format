@@ -9,6 +9,15 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # -------------------- helpers --------------------
 
+def safe_int(v, default=0):
+    try:
+        if v is None: return default
+        s = str(v).strip()
+        if s == "" or s.lower() == "undefined": return default
+        return int(float(s))
+    except Exception:
+        return default
+
 def bottom_half_rect(page):
     r = page.rect
     return fitz.Rect(r.x0, r.y0 + r.height / 2.0, r.x1, r.y1)
@@ -16,13 +25,13 @@ def bottom_half_rect(page):
 def rect_from_params(page, data):
     """
     Build a fitz.Rect from coordsOrigin=pdf + x,y,width,height; 
-    if missing, default to bottom-half.
+    if missing/invalid, default to bottom-half.
     """
     if not data or data.get("coordsOrigin") != "pdf":
         return bottom_half_rect(page)
     try:
-        x = float(data["x"]); y = float(data["y"])
-        w = float(data["width"]); h = float(data["height"])
+        x = float(data.get("x")); y = float(data.get("y"))
+        w = float(data.get("width")); h = float(data.get("height"))
         pr = page.rect
         rx0 = max(pr.x0, x); ry0 = max(pr.y0, y)
         rx1 = min(pr.x1, x + w); ry1 = min(pr.y1, y + h)
@@ -59,6 +68,29 @@ def count_vector_segments_in(page, clip):
                 segs += 1
     return segs
 
+def sum_raster_coverage_in_clip(page, clip):
+    """
+    Return total raster area intersecting the clip, and coverage ratio (0..1).
+    (Simple sum; overlaps may overcount a bit but it's fine for a heuristic.)
+    """
+    clip_area = max(1.0, clip.get_area())
+    total_inter = 0.0
+    for img in page.get_images(full=True):
+        try:
+            bbox = page.get_image_bbox(img)
+            # if page.get_image_bbox raises on tuple, try xref
+        except Exception:
+            xref = img[0] if isinstance(img, (tuple, list)) else None
+            if not xref:
+                continue
+            bbox = page.get_image_bbox(xref)
+
+        inter = fitz.Rect(bbox).intersect(clip).get_area()
+        total_inter += inter
+
+    coverage = min(1.0, total_inter / clip_area) if clip_area > 0 else 0.0
+    return total_inter, coverage
+
 def find_largest_image_in_clip(page, clip):
     """
     Return (xref, interRect, bboxRect) for the image covering largest area in clip.
@@ -71,7 +103,7 @@ def find_largest_image_in_clip(page, clip):
             xref = img[0] if isinstance(img, (tuple, list)) else None
         except Exception:
             xref = img[0] if isinstance(img, (tuple, list)) else None
-            if not xref: 
+            if not xref:
                 continue
             bbox = page.get_image_bbox(xref)
         rb = fitz.Rect(bbox)
@@ -82,23 +114,33 @@ def find_largest_image_in_clip(page, clip):
             best_area = a
     return best  # (xref, interRect, fullBBox) or None
 
-def decide_format(raster_count, vector_segments):
+def decide_format_majority(raster_coverage, vector_segments):
     """
-    Heuristic: prefer 'has raster' if any image and few vectors.
+    Always return only 'has raster' or 'has vector'.
+    Majority rule:
+      - Compute vector_score in [0..1] vs a strong threshold.
+      - Use raster_score = coverage in [0..1].
+      - Choose the higher score. Ties break to raster (safer for production).
     """
     VEC_MIN_WEAK   = 20
     VEC_MIN_STRONG = 80
-    if raster_count > 0 and vector_segments < VEC_MIN_WEAK:
-        return "has raster"
-    if raster_count > 0 and vector_segments >= VEC_MIN_WEAK:
-        return "mixed"
-    if vector_segments >= VEC_MIN_STRONG and raster_count == 0:
+
+    # quick wins
+    if raster_coverage <= 0.01 and vector_segments >= VEC_MIN_WEAK:
         return "has vector"
-    if vector_segments >= VEC_MIN_WEAK and raster_count == 0:
-        return "has vector"
-    if raster_count > 0:
+    if raster_coverage >= 0.25 and vector_segments < VEC_MIN_WEAK:
         return "has raster"
-    return "unknown"
+
+    # normalized scores
+    vector_score = max(0.0, min(1.0, vector_segments / float(VEC_MIN_STRONG)))
+    raster_score = max(0.0, min(1.0, raster_coverage))
+
+    if vector_score > raster_score:
+        return "has vector"
+    if raster_score > vector_score:
+        return "has raster"
+    # tie
+    return "has raster"
 
 # -------------------- routes --------------------
 
@@ -116,20 +158,14 @@ def detect_art_format():
       x, y, width, height: PDF points (72 pt = 1 in)
     Returns:
       {
-        "format": "has raster" | "has vector" | "mixed" | "unknown",
+        "format": "has raster" | "has vector",
         "metrics": {
           "region": "clip" | "bottom-half",
           "rasterCount": int,
+          "rasterCoverage": float(0..1),
           "vectorSegments": int,
-          "nativeRaster": {
-            "nativePxW": int,
-            "nativePxH": int,
-            "placedWIn": float,
-            "placedHIn": float,
-            "nativeDpiX": float,
-            "nativeDpiY": float,
-            "nativeDpiMin": float
-          }
+          "nativeRaster": {...optional...},
+          "scores": {"raster": float, "vector": float}
         }
       }
     """
@@ -138,25 +174,26 @@ def detect_art_format():
             return jsonify({"error": "No file field 'pdf'"}), 400
 
         file = request.files["pdf"]
-        filepath = os.path.join(UPLOAD_FOLDER, file.filename)
+        filename = file.filename or "upload.pdf"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
         file.save(filepath)
 
         doc = fitz.open(filepath)
-        page_index = int(request.form.get("pageIndex", "0"))
+        page_index = safe_int(request.form.get("pageIndex"), 0)
+        if page_index < 0 or page_index >= len(doc):
+            page_index = 0
         page = doc.load_page(page_index)
         clip = rect_from_params(page, request.form)
 
-        # count vector segments in clip
+        # vector + raster measures
         vector_segments = count_vector_segments_in(page, clip)
+        _, raster_coverage = sum_raster_coverage_in_clip(page, clip)
 
-        # count total rasters on page (cheap metric)
-        raster_count = len(page.get_images(full=True))
-
-        # largest raster intersecting the clip (for native DPI)
+        # largest raster (for DPI metrics)
         native = {}
         largest = find_largest_image_in_clip(page, clip)
         if largest:
-            xref, inter_rect, full_bbox = largest
+            xref, inter_rect, _ = largest
             native_px_w = native_px_h = 0
             if xref:
                 try:
@@ -182,15 +219,25 @@ def detect_art_format():
                 "nativeDpiMin": round(dpi_min, 1)
             }
 
-        fmt = decide_format(raster_count, vector_segments)
+        # decision (no 'mixed')
+        fmt = decide_format_majority(raster_coverage, vector_segments)
+
+        # diagnostics (optional but handy)
+        # mirror the internal scores used for the decision
+        scores = {
+            "raster": round(max(0.0, min(1.0, raster_coverage)), 3),
+            "vector": round(max(0.0, min(1.0, vector_segments / 80.0)), 3),
+        }
 
         return jsonify({
-            "format": fmt,
+            "format": fmt,  # only 'has raster' or 'has vector'
             "metrics": {
                 "region": "clip" if request.form.get("coordsOrigin") == "pdf" else "bottom-half",
-                "rasterCount": raster_count,
-                "vectorSegments": vector_segments,
-                **({"nativeRaster": native} if native else {})
+                "rasterCount": len(page.get_images(full=True)),
+                "rasterCoverage": round(raster_coverage, 3),
+                "vectorSegments": int(vector_segments),
+                **({"nativeRaster": native} if native else {}),
+                "scores": scores
             }
         })
 
@@ -207,12 +254,14 @@ def extract_design_image():
             return jsonify({"error": "No file field 'pdf'"}), 400
 
         file = request.files["pdf"]
-        filename = file.filename
+        filename = file.filename or "upload.pdf"
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         file.save(filepath)
 
         doc = fitz.open(filepath)
-        page_index = int(request.form.get("pageIndex", "0"))
+        page_index = safe_int(request.form.get("pageIndex"), 0)
+        if page_index < 0 or page_index >= len(doc):
+            page_index = 0
         page = doc.load_page(page_index)
         clip = rect_from_params(page, request.form)
 
