@@ -1,34 +1,113 @@
-# app.py  (Flask + PyMuPDF)
+# main.py
 from flask import Flask, request, jsonify, send_file
 import fitz  # PyMuPDF
 import os
+import io
 
 app = Flask(__name__)
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # -------------------- helpers --------------------
+
+def safe_int(v, default=0):
+    try:
+        return int(float(v))
+    except Exception:
+        return default
+
+def bottom_half_rect(page):
+    r = page.rect
+    return fitz.Rect(r.x0, r.y0 + r.height / 2.0, r.x1, r.y1)
+
+def rect_from_params(page, data):
+    """
+    Build a fitz.Rect from coordsOrigin=pdf + x,y,width,height;
+    if missing, default to bottom-half.
+    """
+    if not data or data.get("coordsOrigin") != "pdf":
+        return bottom_half_rect(page)
+    try:
+        x = float(data["x"]); y = float(data["y"])
+        w = float(data["width"]); h = float(data["height"])
+        pr = page.rect
+        rx0 = max(pr.x0, x); ry0 = max(pr.y0, y)
+        rx1 = min(pr.x1, x + w); ry1 = min(pr.y1, y + h)
+        return fitz.Rect(rx0, ry0, rx1, ry1)
+    except Exception:
+        return bottom_half_rect(page)
+
+def count_vector_segments_in(page, clip):
+    """
+    Fallback signal for pure-vector pages:
+    count vector path ops intersecting the clip, ignoring hairline/template crumbs
+    and ignoring rectangle ops (background panels).
+    """
+    drawings = page.get_drawings()
+    segs = 0
+    VECTOR_OPS = {"m", "l", "c", "v", "y", "h"}  # intentionally exclude 're' (rectangles)
+    for d in drawings:
+        # skip hairlines
+        if float(d.get("width") or 0) <= 0.25:
+            continue
+        # quick reject if bbox outside clip
+        if "rect" in d and not fitz.Rect(d["rect"]).intersects(clip):
+            continue
+        for it in d.get("items", []):
+            op = str(it[0]).lower() if it else ""
+            if op in VECTOR_OPS:
+                segs += 1
+    return segs
+
+def sum_raster_coverage_in_clip(page, clip):
+    """
+    Sum (approximately) the raster image coverage within the clip.
+    Returns (sum_area, coverage_ratio 0..1).
+    Note: We sum image intersections; overlap is rare in proofs and the total
+    is clamped to the clip area.
+    """
+    clip_area = max(1.0, clip.get_area())
+    total = 0.0
+    for img in page.get_images(full=True):
+        try:
+            # PyMuPDF accepts xref or tuple depending on version
+            bbox = page.get_image_bbox(img)
+        except Exception:
+            xref = img[0] if isinstance(img, (tuple, list)) else img
+            if not xref:
+                continue
+            bbox = page.get_image_bbox(xref)
+        inter = fitz.Rect(bbox).intersect(clip)
+        total += inter.get_area()
+    cov = min(1.0, total / clip_area)
+    return total, cov
+
 def text_coverage_in_clip(page, clip):
     """
-    Approximate vector/text coverage by summing text block areas that intersect the clip.
-    Works well for typical PDF text (fonts). Returned as ratio 0..1.
+    Sum area of TEXT blocks only (block_type == 0) inside the clip.
+    Returns ratio 0..1.
     """
     clip_area = max(1.0, clip.get_area())
     total = 0.0
     try:
+        # blocks: (x0, y0, x1, y1, "text", block_no, block_type, ...)
         for b in page.get_text("blocks") or []:
-            # blocks = (x0, y0, x1, y1, text, block_no, block_type, ...)
+            # Only text blocks (block_type==0). Some PyMuPDF versions place type in b[6].
+            block_type = None
+            if len(b) >= 7:
+                block_type = b[6]
+            if block_type not in (0, None) and block_type != 0:
+                continue  # skip non-text (images, etc.)
             r = fitz.Rect(b[:4])
             total += r.intersect(clip).get_area()
     except Exception:
         pass
     return min(1.0, total / clip_area)
 
-
 def drawings_coverage_in_clip(page, clip):
     """
-    Approximate vector shape coverage from page.get_drawings().
-    We apply low weights to rectangles (likely backgrounds) and modest weights to other shapes.
+    Approximate vector-shape coverage from page.get_drawings().
+    We down-weight rectangles (likely panels/backgrounds) so they don't dominate.
     Returned as ratio 0..1.
     """
     drawings = page.get_drawings()
@@ -36,7 +115,6 @@ def drawings_coverage_in_clip(page, clip):
     weighted_area = 0.0
 
     for d in drawings:
-        # skip hairlines and anything entirely outside the clip
         if float(d.get("width") or 0) <= 0.25:
             continue
         if "rect" not in d:
@@ -49,104 +127,17 @@ def drawings_coverage_in_clip(page, clip):
             continue
 
         frac = inter_area / clip_area
-        # is this drawing just a rectangle op?
+        # Is this drawing mainly a rectangle op?
         is_rect_op = any((it and str(it[0]).lower() == "re") for it in d.get("items", []))
 
-        # weight logic:
-        # - large rectangles (likely panels/backgrounds) get very small weight
-        # - smaller rectangles get small weight
-        # - other shapes get medium weight
+        # weights: down-weight big panels; modest weight for other shapes
         if is_rect_op:
-            weight = 0.15 if frac >= 0.25 else 0.30
+            weight = 0.05 if frac >= 0.25 else 0.15  # big panels barely count
         else:
-            weight = 0.60
-
+            weight = 0.40  # generic vector shapes
         weighted_area += inter_area * weight
 
     return min(1.0, weighted_area / clip_area)
-
-
-def safe_int(v, default=0):
-    try:
-        if v is None: return default
-        s = str(v).strip()
-        if s == "" or s.lower() == "undefined": return default
-        return int(float(s))
-    except Exception:
-        return default
-
-def bottom_half_rect(page):
-    r = page.rect
-    return fitz.Rect(r.x0, r.y0 + r.height / 2.0, r.x1, r.y1)
-
-def rect_from_params(page, data):
-    """
-    Build a fitz.Rect from coordsOrigin=pdf + x,y,width,height; 
-    if missing/invalid, default to bottom-half.
-    """
-    if not data or data.get("coordsOrigin") != "pdf":
-        return bottom_half_rect(page)
-    try:
-        x = float(data.get("x")); y = float(data.get("y"))
-        w = float(data.get("width")); h = float(data.get("height"))
-        pr = page.rect
-        rx0 = max(pr.x0, x); ry0 = max(pr.y0, y)
-        rx1 = min(pr.x1, x + w); ry1 = min(pr.y1, y + h)
-        return fitz.Rect(rx0, ry0, rx1, ry1)
-    except Exception:
-        return bottom_half_rect(page)
-
-def count_vector_segments_in(page, clip):
-    """
-    Count meaningful vector path segments intersecting the clip,
-    ignoring hairline/template crumbs.
-    """
-    drawings = page.get_drawings()
-    segs = 0
-    VECTOR_OPS = {"m","l","c","v","y","re","h"}  # move/line/cubic/rect/close
-    clip_area = max(1.0, clip.get_area())
-
-    for d in drawings:
-        # quick reject: bbox outside clip
-        if "rect" in d and not fitz.Rect(d["rect"]).intersects(clip):
-            continue
-        # ignore ultra-thin template lines
-        if float(d.get("width") or 0) <= 0.25:
-            continue
-        # ignore geometry whose bbox is tiny vs clip
-        if "rect" in d:
-            inter_area = fitz.Rect(d["rect"]).intersect(clip).get_area()
-            if inter_area / clip_area < 0.0005:  # < 0.05% of clip area
-                continue
-
-        for it in d.get("items", []):
-            op = str(it[0]).lower() if it else ""
-            if op in VECTOR_OPS:
-                segs += 1
-    return segs
-
-def sum_raster_coverage_in_clip(page, clip):
-    """
-    Return total raster area intersecting the clip, and coverage ratio (0..1).
-    (Simple sum; overlaps may overcount a bit but it's fine for a heuristic.)
-    """
-    clip_area = max(1.0, clip.get_area())
-    total_inter = 0.0
-    for img in page.get_images(full=True):
-        try:
-            bbox = page.get_image_bbox(img)
-            # if page.get_image_bbox raises on tuple, try xref
-        except Exception:
-            xref = img[0] if isinstance(img, (tuple, list)) else None
-            if not xref:
-                continue
-            bbox = page.get_image_bbox(xref)
-
-        inter = fitz.Rect(bbox).intersect(clip).get_area()
-        total_inter += inter
-
-    coverage = min(1.0, total_inter / clip_area) if clip_area > 0 else 0.0
-    return total_inter, coverage
 
 def find_largest_image_in_clip(page, clip):
     """
@@ -173,33 +164,32 @@ def find_largest_image_in_clip(page, clip):
 
 def decide_format_coverage(raster_cov, vector_cov, vector_segments):
     """
-    Majority by coverage with sensible tie-breaks.
-    - raster_cov, vector_cov are 0..1
-    - vector_segments is a fallback signal for pure-vector pages
+    Majority-by-coverage with sensible biases:
+      - prefer raster when close (text shouldn’t beat a big image)
+      - strong safeguard for true vector pages (no rasters, many segments)
     """
-    # clear wins by margin
-    if raster_cov >= vector_cov + 0.08:
+    # clear wins
+    if raster_cov >= vector_cov + 0.05:
         return "has raster"
-    if vector_cov >= raster_cov + 0.08:
+    if vector_cov >= raster_cov + 0.15:
         return "has vector"
 
-    # bias to raster if a noticeable image exists and vector coverage is small
-    if raster_cov >= 0.15 and vector_cov <= 0.25:
+    # raster present and vector coverage small -> raster
+    if raster_cov >= 0.20 and vector_cov <= 0.30:
         return "has raster"
 
-    # pure-vector safeguard (e.g., logos/illustrations with no images)
+    # pure-vector safeguard
     if raster_cov <= 0.03 and vector_segments >= 120:
         return "has vector"
 
-    # otherwise, pick the larger coverage; tie → raster
+    # tie/near-tie: bias to raster (text shouldn't override a big photo)
     return "has raster" if raster_cov >= vector_cov else "has vector"
-
 
 # -------------------- routes --------------------
 
 @app.route("/")
 def home():
-    return "Art Format Detector is live!"
+    return "Art Format Detector is live (coverage-first)."
 
 @app.route("/detect-art-format", methods=["POST"])
 def detect_art_format():
@@ -214,19 +204,20 @@ def detect_art_format():
 
         doc = fitz.open(filepath)
         page_index = safe_int(request.form.get("pageIndex"), 0)
-        if page_index < 0 or page_index >= len(doc):
-            page_index = 0
+        page_index = max(0, min(page_index, len(doc) - 1))
         page = doc.load_page(page_index)
-        clip = rect_from_params(page, request.form)   # your existing bottom-half or coords
+        clip = rect_from_params(page, request.form)
 
-        # measures
-        vector_segments = count_vector_segments_in(page, clip)      # keep as a backup signal
-        _, raster_coverage = sum_raster_coverage_in_clip(page, clip)
-        vector_cov_text = text_coverage_in_clip(page, clip)
-        vector_cov_draw = drawings_coverage_in_clip(page, clip)
-        vector_coverage = max(0.0, min(1.0, vector_cov_text + vector_cov_draw))
+        # coverage metrics
+        _, raster_cov = sum_raster_coverage_in_clip(page, clip)
+        text_cov = text_coverage_in_clip(page, clip)
+        draw_cov = drawings_coverage_in_clip(page, clip)
+        vector_cov = max(0.0, min(1.0, text_cov + draw_cov))
 
-        # native raster metrics (as you had)
+        # backup signal for true-vector pages
+        vector_segments = count_vector_segments_in(page, clip)
+
+        # native raster (largest in clip)
         native = {}
         largest = find_largest_image_in_clip(page, clip)
         if largest:
@@ -239,11 +230,13 @@ def detect_art_format():
                     native_px_h = int(info.get("height") or 0)
                 except Exception:
                     pass
+
             placed_w_in = inter_rect.width / 72.0 if inter_rect.width else 0
             placed_h_in = inter_rect.height / 72.0 if inter_rect.height else 0
             dpi_x = (native_px_w / placed_w_in) if placed_w_in > 0 else 0
             dpi_y = (native_px_h / placed_h_in) if placed_h_in > 0 else 0
             dpi_min = min(dpi_x, dpi_y) if dpi_x and dpi_y else 0
+
             native = {
                 "nativePxW": native_px_w,
                 "nativePxH": native_px_h,
@@ -251,25 +244,27 @@ def detect_art_format():
                 "placedHIn": round(placed_h_in, 3),
                 "nativeDpiX": round(dpi_x, 1),
                 "nativeDpiY": round(dpi_y, 1),
-                "nativeDpiMin": round(dpi_min, 1)
+                "nativeDpiMin": round(dpi_min, 1),
             }
 
-        fmt = decide_format_coverage(raster_coverage, vector_coverage, vector_segments)
+        fmt = decide_format_coverage(raster_cov, vector_cov, vector_segments)
 
         return jsonify({
             "format": fmt,  # 'has raster' or 'has vector'
             "metrics": {
                 "region": "clip" if request.form.get("coordsOrigin") == "pdf" else "bottom-half",
                 "rasterCount": len(page.get_images(full=True)),
-                "rasterCoverage": round(raster_coverage, 3),
-                "vectorCoverage": round(vector_coverage, 3),
+                "rasterCoverage": round(raster_cov, 3),
+                "vectorCoverage": round(vector_cov, 3),
+                "textCoverage": round(text_cov, 3),
+                "drawingsCoverage": round(draw_cov, 3),
                 "vectorSegments": int(vector_segments),
                 **({"nativeRaster": native} if native else {})
             }
         })
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/extract-design-image", methods=["POST"])
 def extract_design_image():
@@ -287,8 +282,7 @@ def extract_design_image():
 
         doc = fitz.open(filepath)
         page_index = safe_int(request.form.get("pageIndex"), 0)
-        if page_index < 0 or page_index >= len(doc):
-            page_index = 0
+        page_index = max(0, min(page_index, len(doc) - 1))
         page = doc.load_page(page_index)
         clip = rect_from_params(page, request.form)
 
