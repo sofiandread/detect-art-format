@@ -107,15 +107,16 @@ def text_coverage_in_clip(page, clip):
 def drawings_coverage_in_clip(page, clip):
     """
     Approximate vector-shape coverage from page.get_drawings().
-    We down-weight rectangles (likely panels/backgrounds) so they don't dominate.
-    Returned as ratio 0..1.
+    Big filled panels (background rectangles or path-filled boxes) are heavily
+    down-weighted so they don't dominate. Returns ratio 0..1.
     """
     drawings = page.get_drawings()
     clip_area = max(1.0, clip.get_area())
     weighted_area = 0.0
 
     for d in drawings:
-        if float(d.get("width") or 0) <= 0.25:
+        width = float(d.get("width") or 0)
+        if width <= 0.25:  # hairlines / template crumbs
             continue
         if "rect" not in d:
             continue
@@ -127,14 +128,21 @@ def drawings_coverage_in_clip(page, clip):
             continue
 
         frac = inter_area / clip_area
-        # Is this drawing mainly a rectangle op?
-        is_rect_op = any((it and str(it[0]).lower() == "re") for it in d.get("items", []))
+        items = d.get("items", [])
+        is_rect_op = any((it and str(it[0]).lower() == "re") for it in items)
 
-        # weights: down-weight big panels; modest weight for other shapes
-        if is_rect_op:
-            weight = 0.05 if frac >= 0.25 else 0.15  # big panels barely count
+        # Heuristic: "big filled shape with little/no stroke" → treat as background panel
+        is_filled = d.get("fill") is not None
+        has_stroke = width > 0.25
+        small_path = len(items) <= 5
+
+        if (is_rect_op and frac >= 0.15) or (is_filled and not has_stroke and small_path and frac >= 0.15):
+            weight = 0.05      # panels: barely count
+        elif is_rect_op:
+            weight = 0.15      # smaller rectangles
         else:
-            weight = 0.40  # generic vector shapes
+            weight = 0.30      # generic vector shapes
+
         weighted_area += inter_area * weight
 
     return min(1.0, weighted_area / clip_area)
@@ -164,26 +172,25 @@ def find_largest_image_in_clip(page, clip):
 
 def decide_format_coverage(raster_cov, vector_cov, vector_segments):
     """
-    Majority-by-coverage with sensible biases:
-      - prefer raster when close (text shouldn’t beat a big image)
-      - strong safeguard for true vector pages (no rasters, many segments)
+    Coverage-majority with raster bias on near ties and safeguard for pure-vector pages.
     """
-    # clear wins
-    if raster_cov >= vector_cov + 0.05:
+    # Clear wins
+    if raster_cov >= vector_cov + 0.01:   # small margin → raster
         return "has raster"
-    if vector_cov >= raster_cov + 0.15:
+    if vector_cov >= raster_cov + 0.12:   # vector needs a clearer margin
         return "has vector"
 
-    # raster present and vector coverage small -> raster
-    if raster_cov >= 0.20 and vector_cov <= 0.30:
+    # If there is a noticeable image and vectors are relatively small → raster
+    if raster_cov >= 0.15 and vector_cov <= 0.30:
         return "has raster"
 
-    # pure-vector safeguard
-    if raster_cov <= 0.03 and vector_segments >= 120:
+    # Pure-vector safeguard (logos/illustrations with no rasters)
+    if raster_cov <= 0.03 and vector_segments >= 80:
         return "has vector"
 
-    # tie/near-tie: bias to raster (text shouldn't override a big photo)
-    return "has raster" if raster_cov >= vector_cov else "has vector"
+    # Otherwise default to raster (text shouldn't beat a big photo)
+    return "has raster"
+
 
 # -------------------- routes --------------------
 
@@ -209,10 +216,15 @@ def detect_art_format():
         clip = rect_from_params(page, request.form)
 
         # coverage metrics
-        _, raster_cov = sum_raster_coverage_in_clip(page, clip)
-        text_cov = text_coverage_in_clip(page, clip)
-        draw_cov = drawings_coverage_in_clip(page, clip)
-        vector_cov = max(0.0, min(1.0, text_cov + draw_cov))
+      text_cov = text_coverage_in_clip(page, clip)
+draw_cov = drawings_coverage_in_clip(page, clip)
+
+# ↓ shrink drawings influence so text can't outrank a big photo
+vector_cov = min(1.0, text_cov + 0.30 * draw_cov)
+
+# (optional: expose for debugging)
+effective_vector_cov = vector_cov
+
 
         # backup signal for true-vector pages
         vector_segments = count_vector_segments_in(page, clip)
