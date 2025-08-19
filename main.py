@@ -8,6 +8,63 @@ UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # -------------------- helpers --------------------
+def text_coverage_in_clip(page, clip):
+    """
+    Approximate vector/text coverage by summing text block areas that intersect the clip.
+    Works well for typical PDF text (fonts). Returned as ratio 0..1.
+    """
+    clip_area = max(1.0, clip.get_area())
+    total = 0.0
+    try:
+        for b in page.get_text("blocks") or []:
+            # blocks = (x0, y0, x1, y1, text, block_no, block_type, ...)
+            r = fitz.Rect(b[:4])
+            total += r.intersect(clip).get_area()
+    except Exception:
+        pass
+    return min(1.0, total / clip_area)
+
+
+def drawings_coverage_in_clip(page, clip):
+    """
+    Approximate vector shape coverage from page.get_drawings().
+    We apply low weights to rectangles (likely backgrounds) and modest weights to other shapes.
+    Returned as ratio 0..1.
+    """
+    drawings = page.get_drawings()
+    clip_area = max(1.0, clip.get_area())
+    weighted_area = 0.0
+
+    for d in drawings:
+        # skip hairlines and anything entirely outside the clip
+        if float(d.get("width") or 0) <= 0.25:
+            continue
+        if "rect" not in d:
+            continue
+
+        rect = fitz.Rect(d["rect"])
+        inter = rect.intersect(clip)
+        inter_area = inter.get_area()
+        if inter_area <= 0:
+            continue
+
+        frac = inter_area / clip_area
+        # is this drawing just a rectangle op?
+        is_rect_op = any((it and str(it[0]).lower() == "re") for it in d.get("items", []))
+
+        # weight logic:
+        # - large rectangles (likely panels/backgrounds) get very small weight
+        # - smaller rectangles get small weight
+        # - other shapes get medium weight
+        if is_rect_op:
+            weight = 0.15 if frac >= 0.25 else 0.30
+        else:
+            weight = 0.60
+
+        weighted_area += inter_area * weight
+
+    return min(1.0, weighted_area / clip_area)
+
 
 def safe_int(v, default=0):
     try:
@@ -114,33 +171,29 @@ def find_largest_image_in_clip(page, clip):
             best_area = a
     return best  # (xref, interRect, fullBBox) or None
 
-def decide_format_majority(raster_coverage, vector_segments):
+def decide_format_coverage(raster_cov, vector_cov, vector_segments):
     """
-    Always return only 'has raster' or 'has vector'.
-    Majority rule:
-      - Compute vector_score in [0..1] vs a strong threshold.
-      - Use raster_score = coverage in [0..1].
-      - Choose the higher score. Ties break to raster (safer for production).
+    Majority by coverage with sensible tie-breaks.
+    - raster_cov, vector_cov are 0..1
+    - vector_segments is a fallback signal for pure-vector pages
     """
-    VEC_MIN_WEAK   = 20
-    VEC_MIN_STRONG = 80
-
-    # quick wins
-    if raster_coverage <= 0.01 and vector_segments >= VEC_MIN_WEAK:
+    # clear wins by margin
+    if raster_cov >= vector_cov + 0.08:
+        return "has raster"
+    if vector_cov >= raster_cov + 0.08:
         return "has vector"
-    if raster_coverage >= 0.25 and vector_segments < VEC_MIN_WEAK:
+
+    # bias to raster if a noticeable image exists and vector coverage is small
+    if raster_cov >= 0.15 and vector_cov <= 0.25:
         return "has raster"
 
-    # normalized scores
-    vector_score = max(0.0, min(1.0, vector_segments / float(VEC_MIN_STRONG)))
-    raster_score = max(0.0, min(1.0, raster_coverage))
-
-    if vector_score > raster_score:
+    # pure-vector safeguard (e.g., logos/illustrations with no images)
+    if raster_cov <= 0.03 and vector_segments >= 120:
         return "has vector"
-    if raster_score > vector_score:
-        return "has raster"
-    # tie
-    return "has raster"
+
+    # otherwise, pick the larger coverage; tie → raster
+    return "has raster" if raster_cov >= vector_cov else "has vector"
+
 
 # -------------------- routes --------------------
 
@@ -150,25 +203,6 @@ def home():
 
 @app.route("/detect-art-format", methods=["POST"])
 def detect_art_format():
-    """
-    Form-Data:
-      pdf: file
-      pageIndex: int (default 0)
-      coordsOrigin: 'pdf' to enable x/y/width/height
-      x, y, width, height: PDF points (72 pt = 1 in)
-    Returns:
-      {
-        "format": "has raster" | "has vector",
-        "metrics": {
-          "region": "clip" | "bottom-half",
-          "rasterCount": int,
-          "rasterCoverage": float(0..1),
-          "vectorSegments": int,
-          "nativeRaster": {...optional...},
-          "scores": {"raster": float, "vector": float}
-        }
-      }
-    """
     try:
         if "pdf" not in request.files:
             return jsonify({"error": "No file field 'pdf'"}), 400
@@ -183,13 +217,16 @@ def detect_art_format():
         if page_index < 0 or page_index >= len(doc):
             page_index = 0
         page = doc.load_page(page_index)
-        clip = rect_from_params(page, request.form)
+        clip = rect_from_params(page, request.form)   # your existing bottom-half or coords
 
-        # vector + raster measures
-        vector_segments = count_vector_segments_in(page, clip)
+        # measures
+        vector_segments = count_vector_segments_in(page, clip)      # keep as a backup signal
         _, raster_coverage = sum_raster_coverage_in_clip(page, clip)
+        vector_cov_text = text_coverage_in_clip(page, clip)
+        vector_cov_draw = drawings_coverage_in_clip(page, clip)
+        vector_coverage = max(0.0, min(1.0, vector_cov_text + vector_cov_draw))
 
-        # largest raster (for DPI metrics)
+        # native raster metrics (as you had)
         native = {}
         largest = find_largest_image_in_clip(page, clip)
         if largest:
@@ -202,13 +239,11 @@ def detect_art_format():
                     native_px_h = int(info.get("height") or 0)
                 except Exception:
                     pass
-
             placed_w_in = inter_rect.width / 72.0 if inter_rect.width else 0
             placed_h_in = inter_rect.height / 72.0 if inter_rect.height else 0
             dpi_x = (native_px_w / placed_w_in) if placed_w_in > 0 else 0
             dpi_y = (native_px_h / placed_h_in) if placed_h_in > 0 else 0
             dpi_min = min(dpi_x, dpi_y) if dpi_x and dpi_y else 0
-
             native = {
                 "nativePxW": native_px_w,
                 "nativePxH": native_px_h,
@@ -219,30 +254,22 @@ def detect_art_format():
                 "nativeDpiMin": round(dpi_min, 1)
             }
 
-        # decision (no 'mixed')
-        fmt = decide_format_majority(raster_coverage, vector_segments)
-
-        # diagnostics (optional but handy)
-        # mirror the internal scores used for the decision
-        scores = {
-            "raster": round(max(0.0, min(1.0, raster_coverage)), 3),
-            "vector": round(max(0.0, min(1.0, vector_segments / 80.0)), 3),
-        }
+        fmt = decide_format_coverage(raster_coverage, vector_coverage, vector_segments)
 
         return jsonify({
-            "format": fmt,  # only 'has raster' or 'has vector'
+            "format": fmt,  # 'has raster' or 'has vector'
             "metrics": {
                 "region": "clip" if request.form.get("coordsOrigin") == "pdf" else "bottom-half",
                 "rasterCount": len(page.get_images(full=True)),
                 "rasterCoverage": round(raster_coverage, 3),
+                "vectorCoverage": round(vector_coverage, 3),
                 "vectorSegments": int(vector_segments),
-                **({"nativeRaster": native} if native else {}),
-                "scores": scores
+                **({"nativeRaster": native} if native else {})
             }
         })
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/extract-design-image", methods=["POST"])
 def extract_design_image():
