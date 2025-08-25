@@ -33,48 +33,37 @@ def rect_from_params(page, data):
         return bottom_half_rect(page)
 
 def count_vector_segments_in(page, clip):
+    """
+    Count meaningful vector segments in the clip.
+    - Count FILLED paths even if stroke width is tiny/0 (most logos).
+    - Ignore giant filled rectangles/panels that cover the mock area.
+    """
     drawings = page.get_drawings()
     segs = 0
-    VECTOR_OPS = {"m", "l", "c", "v", "y", "h"}  # exclude 're' rectangles
     for d in drawings:
-        if float(d.get("width") or 0) <= 0.25:
+        rect = fitz.Rect(d["rect"]) if "rect" in d else None
+        if rect and not rect.intersects(clip):
             continue
-        if "rect" in d and not fitz.Rect(d["rect"]).intersects(clip):
-            continue
-        for it in d.get("items", []):
-            op = str(it[0]).lower() if it else ""
-            if op in VECTOR_OPS:
+
+        items = d.get("items", []) or []
+        width = float(d.get("width") or 0)
+        has_fill = d.get("fill") is not None
+
+        # Ignore huge panels that cover ≥15% of the clip and have few items (likely the dark mock box)
+        if rect:
+            frac = rect.intersect(clip).get_area() / max(1.0, clip.get_area())
+            if frac >= 0.15 and len(items) < 8:
+                continue
+
+        for it in items:
+            op = (str(it[0]).lower() if it else "")
+            # count path ops; allow 're' if it's filled (logos often use filled rects)
+            if op in {"m", "l", "c", "v", "y", "h", "re"}:
+                # if there's no fill, keep a small width floor to skip hairline guides
+                if not has_fill and width <= 0.25:
+                    continue
                 segs += 1
     return segs
-
-def sum_raster_coverage_in_clip(page, clip):
-    clip_area = max(1.0, clip.get_area())
-    total = 0.0
-    for img in page.get_images(full=True):
-        try:
-            bbox = page.get_image_bbox(img)
-        except Exception:
-            xref = img[0] if isinstance(img, (tuple, list)) else img
-            if not xref:
-                continue
-            bbox = page.get_image_bbox(xref)
-        inter = fitz.Rect(bbox).intersect(clip)
-        total += inter.get_area()
-    return total, min(1.0, total / clip_area)
-
-def text_coverage_in_clip(page, clip):
-    clip_area = max(1.0, clip.get_area())
-    total = 0.0
-    try:
-        for b in page.get_text("blocks") or []:
-            block_type = b[6] if len(b) >= 7 else 0
-            if block_type != 0:      # keep only TEXT blocks
-                continue
-            r = fitz.Rect(b[:4])
-            total += r.intersect(clip).get_area()
-    except Exception:
-        pass
-    return min(1.0, total / clip_area)
 
 def drawings_coverage_in_clip(page, clip):
     """
@@ -152,6 +141,9 @@ def decide_format_coverage(raster_cov, vector_cov, vector_segments, raster_count
 
     # Pure-vector safeguard (logos with no rasters but many segments)
     if raster_cov <= 0.03 and vector_segments >= 40:
+        return "has vector"
+        # If there's clear vector structure and the biggest raster in the clip is low-detail, prefer vector.
+    if vector_segments >= 18 and native_dpi_min and native_dpi_min < 40 and raster_cov >= 0.10:
         return "has vector"
 
     # Otherwise: near tie → raster
